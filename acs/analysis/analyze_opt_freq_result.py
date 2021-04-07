@@ -71,6 +71,8 @@ def main():
             has_fine_opted = True  # assumes fine opt job has done, can use better method here e.g., check log
         else:
             has_fine_opted = False
+    # 0.3 Determine solvation calculation statue
+    solv_correction = opt_project_info['level_of_theory']['solv_correction']
 
     # 1. Analyze opt freq result
     # Pre-allocation and set ups
@@ -80,8 +82,8 @@ def main():
     multiplicity = opt_project_info['species']['multiplicity']
 
     # 1.1. Parse info from opt freq output
-    # (a) Assume we are analyzing regular opt results
-    if not has_fine_opted:
+    # (a) Assume we are analyzing regular opt results with fine_opt_freq to do later
+    if has_fine_opted is False:
         opted_conf_fingerprints = opt_project_info['conformer_to_opt_hash_ids']
         fingerprint_to_all_opt_log_info_dict = dict()
         crashing_conformer_hash_ids = list()
@@ -145,8 +147,76 @@ def main():
 
             opt_project_info['conformers'][fingerprint]['energy']['end_of_opt'] = \
                 fingerprint_to_all_opt_log_info_dict[fingerprint]['electronic_energy']['hartree']
+    # (b) Assume we are analyzing regular opt results, but fine_opt_freq is not required
+    if has_fine_opted is None:
+        opted_conf_fingerprints = opt_project_info['conformer_to_opt_hash_ids']
+        fingerprint_to_all_opt_log_info_dict = dict()
+        crashing_conformer_hash_ids = list()
+        normal_termination_conformer_hash_ids = list()
 
-    # (b) Assume we are analyzing fine opt results
+        # 1.1.1 load energy, freq, geom info from log
+        for fingerprint in opted_conf_fingerprints:
+            opt_input_file_path = opt_project_info['conformers'][fingerprint]['file_path']['input']['opt_freq']
+            dir_name, file_name = os.path.split(opt_input_file_path)
+            file_basename, file_extension = os.path.splitext(file_name)
+            new_file_name = file_basename + '.log'
+            opt_output_file_path = os.path.join(dir_name, new_file_name)
+            if not os.path.exists(opt_output_file_path):
+                raise
+            opt_project_info['conformers'][fingerprint]['file_path']['output']['opt_freq'] = opt_output_file_path
+            try:
+                fingerprint_to_all_opt_log_info_dict[fingerprint] = \
+                    process_opt_freq_output(logfile=opt_output_file_path, ess_software=ESS_SOFTWARE, is_ts=is_ts)
+                normal_termination_conformer_hash_ids.append(fingerprint)
+            except ParserError:
+                crashing_conformer_hash_ids.append(fingerprint)
+
+        # 1.1.2 check if crash
+        for fingerprint in opted_conf_fingerprints:
+            opt_project_info['conformers'][fingerprint]['is_crashing'] = \
+                False if fingerprint in normal_termination_conformer_hash_ids else True
+        opt_project_info['crashing_conformer_in_opt_hash_ids'] = tuple(crashing_conformer_hash_ids)
+
+        # 1.1.3 check if geometry makes sense
+        # 1.1.3.1 todo: for non-TS, check isomorphism
+        if not is_ts:
+            pass
+        # 1.1.3.2 todo: for TS, check volume, bond breaking, freq check based on reaction family
+        else:
+            pass
+
+        # 1.1.4 cluster conformers
+        labeled_xyzs = list()
+        for fingerprint in normal_termination_conformer_hash_ids:
+            labeled_xyzs.append((fingerprint, fingerprint_to_all_opt_log_info_dict[fingerprint]['xyz_dict']))
+        distinct_id_xyz_pair = cluster_confs_by_rmsd_with_id(labeled_xyzs=tuple(labeled_xyzs),
+                                                             rmsd_threshold=1e-2,
+                                                             )
+        distinct_conformer_hash_ids = [i[0] for i in distinct_id_xyz_pair]
+        for fingerprint in normal_termination_conformer_hash_ids:
+            opt_project_info['conformers'][fingerprint]['is_distinct'] = \
+                True if fingerprint in distinct_conformer_hash_ids else False
+
+        # 1.1.5 populate valid conformer information
+        # checked conf should also pass other tests such as isomorphism, bond distance, volume etc. Here only use rmsd.
+        checked_conformer_hash_ids = tuple(distinct_conformer_hash_ids)
+
+        for fingerprint in checked_conformer_hash_ids:
+            xyz_dict = fingerprint_to_all_opt_log_info_dict[fingerprint]['xyz_dict']
+            opt_project_info['conformers'][fingerprint]['arc_xyz_after_opt'] = xyz_dict
+            opt_project_info['conformers'][fingerprint]['xyz_str_after_opt'] = xyz_dict_to_xyz_str(xyz_dict)
+
+            opt_project_info['conformers'][fingerprint]['energy']['end_of_opt'] = \
+                fingerprint_to_all_opt_log_info_dict[fingerprint]['electronic_energy']['hartree']
+
+            opt_project_info['conformers'][fingerprint]['frequencies'] = \
+                fingerprint_to_all_opt_log_info_dict[fingerprint]['freq'][0]
+            opt_project_info['conformers'][fingerprint]['negative_frequencies'] = \
+                fingerprint_to_all_opt_log_info_dict[fingerprint]['freq'][1]
+
+        valid_conformer_hash_ids = deepcopy(checked_conformer_hash_ids)
+        opt_project_info['valid_conformer_hash_ids'] = valid_conformer_hash_ids
+    # (c) Assume we are analyzing fine opt results
     # todo: cosolidate code with regular opt
     else:
         opted_conf_fingerprints = opt_project_info['conformer_to_fine_opt_hash_ids']
@@ -220,10 +290,130 @@ def main():
     # 2. Generate input files
     # (a) regular opt only, no need for fine opt
     if has_fine_opted is None:
-    # 2.a.1 orca single point file
-    # 2.a.2. cosmo input file
-    # 2.a.3. save project info
-        raise NotImplementedError
+        level_of_theory = opt_project_info['level_of_theory']['opt_freq']
+        if level_of_theory.lower() not in ['cbs-qb3', 'wb97xd/def2svp', 'wb97m-v/def2-tzvp', 'wb97x-d3/def2-tzvp']:
+            raise NotImplementedError
+
+        valid_conformer_hash_ids = opt_project_info['valid_conformer_hash_ids']
+
+        # 2.a.1 orca single point file
+        # if sp_after_opt is None, use fine opt energy
+        sp_level = opt_project_info['level_of_theory'].get('sp_after_opt', None)
+        if not sp_level:
+            for fingerprint in valid_conformer_hash_ids:
+                opt_project_info['conformers'][fingerprint]['energy']['sp_after_opt'] = \
+                    opt_project_info['conformers'][fingerprint]['energy']['end_of_opt']
+        else:
+            # todo: deal with non orca sp jobs
+            if sp_level.lower() not in ['dlpno-ccsd(t)/def2-tzvp']:
+                raise NotImplementedError
+
+            # 2.a.1.1 generate orca dlpno sp input file
+            sp_dir = os.path.join(project_dir, 'sp')
+            mkdir(sp_dir)
+
+            for i, fingerprint in enumerate(valid_conformer_hash_ids):
+                # todo: deal with the case of no fine opt
+                xyz_str = opt_project_info['conformers'][fingerprint]['xyz_str_after_opt']
+
+                orca_dlpno_input_file_name = str(i) + '_' + str(fingerprint) + '_orca.in'
+                orca_dlpno_input_file_path = os.path.join(sp_dir, orca_dlpno_input_file_name)
+                opt_project_info['conformers'][fingerprint]['file_path']['input'][
+                    'sp_after_opt'] = orca_dlpno_input_file_path
+
+                orca_dlpno_input_file = gen_orca_dlpno_sp_input_file(xyz_str=xyz_str,
+                                                                     charge=charge,
+                                                                     multiplicity=multiplicity,
+                                                                     memory_mb=13800,
+                                                                     cpu_threads=20,
+                                                                     )
+
+                orca_dlpno_output_file_name = str(i) + '_' + str(fingerprint) + '_orca.log'
+                orca_dlpno_output_file_path = os.path.join(sp_dir, orca_dlpno_output_file_name)
+                opt_project_info['conformers'][fingerprint]['file_path']['output'][
+                    'sp_after_opt'] = orca_dlpno_output_file_path
+
+                with open(orca_dlpno_input_file_path, 'w') as f:
+                    f.write(orca_dlpno_input_file)
+
+            # 2.a.1.2 Orca array job submission script
+            last_job_num = len(valid_conformer_hash_ids) - 1
+            sub_script = deepcopy(orca_slurm_array_script)
+            sub_script = sub_script.format(last_job_num=str(last_job_num))
+            sub_script_file_path = os.path.join(sp_dir, 'submit_orca_array.sh')
+            with open(sub_script_file_path, 'w') as f:
+                f.write(sub_script)
+
+            # 2.a.2.4 save sp project info
+            sp_project_info_path = os.path.join(sp_dir, 'sp_project_info.yml')
+            write_yaml_file(path=sp_project_info_path, content=opt_project_info)
+
+        # 2.a.2 generate solvation input file if solv_correction is not None
+        # implemented for cosmo only
+        # The following section uses turbomole to generate cosmo file
+        if solv_correction is None:
+            pass
+        else:
+        # 2.a.2.1 generate turbomole input files
+            cosmo_dir = os.path.join(project_dir, 'cosmo')
+            mkdir(cosmo_dir)
+            xyz_dir = os.path.join(cosmo_dir, 'xyz')
+            mkdir(xyz_dir)
+
+            for i, fingerprint in enumerate(valid_conformer_hash_ids):
+                cosmo_input_file_name = str(i) + '_' + str(fingerprint) + '_cosmo.txt'
+                cosmo_input_file_path = os.path.join(cosmo_dir, cosmo_input_file_name)
+                cosmo_input_file_basename = cosmo_input_file_name.split('.')[0]
+
+                cosmo_input_file = f"{cosmo_input_file_basename} {charge} {multiplicity}"
+
+                with open(cosmo_input_file_path, 'w') as f:
+                    f.write(cosmo_input_file)
+
+                xyz_str = opt_project_info['conformers'][fingerprint]['xyz_str_after_opt']
+                xyz_file = f"{len(xyz_str.splitlines())}\n\n{xyz_str}"
+                xyz_file_name = cosmo_input_file_basename + '.xyz'
+                xyz_file_name_path = os.path.join(xyz_dir, xyz_file_name)
+
+                with open(xyz_file_name_path, 'w') as f:
+                    f.write(xyz_file)
+
+                # 2.c.2.2 Generate cosmo-rs input file
+                cosmo_rs_input_file_name = str(i) + '_' + str(fingerprint) + '_cosmo.inp'
+                cosmo_rs_input_file_path = os.path.join(cosmo_dir, cosmo_rs_input_file_name)
+                opt_project_info['conformers'][fingerprint]['file_path']['input']['solv_correction'] = cosmo_rs_input_file_path
+
+                cosmo_rs_input_file_basename = cosmo_rs_input_file_name.split('.')[0]
+                cosmo_rs_input_file = gen_cosmo_rs_input_file(name=cosmo_rs_input_file_basename)
+
+                cosmo_rs_output_file_name = str(i) + '_' + str(fingerprint) + '_cosmo.tab'
+                cosmo_rs_output_file_path = os.path.join(cosmo_dir, cosmo_rs_output_file_name)
+                opt_project_info['conformers'][fingerprint]['file_path']['output'][
+                    'solv_correction'] = cosmo_rs_output_file_path
+
+                with open(cosmo_rs_input_file_path, 'w') as f:
+                    f.write(cosmo_rs_input_file)
+
+            # 2.a.2.3 Array job submission script
+            # 2.a.2.3.1 for Gaussian cosmo input files
+            last_job_num = len(valid_conformer_hash_ids) - 1
+            sub_script = deepcopy(turbomole_cosmo_slurm_array_script)
+            sub_script = sub_script.format(last_job_num=str(last_job_num))
+            sub_script_file_path = os.path.join(cosmo_dir, 'submit_turbomole_array.sh')
+            with open(sub_script_file_path, 'w') as f:
+                f.write(sub_script)
+
+            # 2.a.2.3.2 for cosmo-rs input files
+            cosmo_sub_script = deepcopy(cosmo_slurm_array_script)
+            cosmo_sub_script = cosmo_sub_script.format(last_job_num=str(last_job_num))
+            cosmo_sub_script_file_path = os.path.join(cosmo_dir, 'submit_cosmo_array.sh')
+            with open(cosmo_sub_script_file_path, 'w') as f:
+                f.write(cosmo_sub_script)
+
+            # 2.a.2.4 save cosmo project info
+            cosmo_project_info_path = os.path.join(cosmo_dir, 'cosmo_project_info.yml')
+            write_yaml_file(path=cosmo_project_info_path, content=opt_project_info)
+
     # (b) generate fine opt input file
     elif has_fine_opted is False:
     # 2.b.1 Gaussian input file
@@ -338,67 +528,70 @@ def main():
             sp_project_info_path = os.path.join(sp_dir, 'sp_project_info.yml')
             write_yaml_file(path=sp_project_info_path, content=opt_project_info)
 
-    # 2.c.2 generate solvation input file
+    # 2.c.2 generate solvation input file if solv_correction is not None
     # implemented for cosmo only
     # The following section uses turbomole to generate cosmo file
-    # 2.c.2.1 generate turbomole input files
-        cosmo_dir = os.path.join(project_dir, 'cosmo')
-        mkdir(cosmo_dir)
-        xyz_dir = os.path.join(cosmo_dir, 'xyz')
-        mkdir(xyz_dir)
+        if solv_correction is None:
+            pass
+        else:
+        # 2.c.2.1 generate turbomole input files
+            cosmo_dir = os.path.join(project_dir, 'cosmo')
+            mkdir(cosmo_dir)
+            xyz_dir = os.path.join(cosmo_dir, 'xyz')
+            mkdir(xyz_dir)
 
-        for i, fingerprint in enumerate(valid_conformer_hash_ids):
-            cosmo_input_file_name = str(i) + '_' + str(fingerprint) + '_cosmo.txt'
-            cosmo_input_file_path = os.path.join(cosmo_dir, cosmo_input_file_name)
-            cosmo_input_file_basename = cosmo_input_file_name.split('.')[0]
+            for i, fingerprint in enumerate(valid_conformer_hash_ids):
+                cosmo_input_file_name = str(i) + '_' + str(fingerprint) + '_cosmo.txt'
+                cosmo_input_file_path = os.path.join(cosmo_dir, cosmo_input_file_name)
+                cosmo_input_file_basename = cosmo_input_file_name.split('.')[0]
 
-            cosmo_input_file = f"{cosmo_input_file_basename} {charge} {multiplicity}"
+                cosmo_input_file = f"{cosmo_input_file_basename} {charge} {multiplicity}"
 
-            with open(cosmo_input_file_path, 'w') as f:
-                f.write(cosmo_input_file)
+                with open(cosmo_input_file_path, 'w') as f:
+                    f.write(cosmo_input_file)
 
-            xyz_str = opt_project_info['conformers'][fingerprint]['xyz_str_after_fine_opt']
-            xyz_file = f"{len(xyz_str.splitlines())}\n\n{xyz_str}"
-            xyz_file_name = cosmo_input_file_basename + '.xyz'
-            xyz_file_name_path = os.path.join(xyz_dir, xyz_file_name)
+                xyz_str = opt_project_info['conformers'][fingerprint]['xyz_str_after_fine_opt']
+                xyz_file = f"{len(xyz_str.splitlines())}\n\n{xyz_str}"
+                xyz_file_name = cosmo_input_file_basename + '.xyz'
+                xyz_file_name_path = os.path.join(xyz_dir, xyz_file_name)
 
-            with open(xyz_file_name_path, 'w') as f:
-                f.write(xyz_file)
+                with open(xyz_file_name_path, 'w') as f:
+                    f.write(xyz_file)
 
-    # 2.c.2.2 Generate cosmo-rs input file
-            cosmo_rs_input_file_name = str(i) + '_' + str(fingerprint) + '_cosmo.inp'
-            cosmo_rs_input_file_path = os.path.join(cosmo_dir, cosmo_rs_input_file_name)
-            opt_project_info['conformers'][fingerprint]['file_path']['input']['solv_correction'] = cosmo_rs_input_file_path
+        # 2.c.2.2 Generate cosmo-rs input file
+                cosmo_rs_input_file_name = str(i) + '_' + str(fingerprint) + '_cosmo.inp'
+                cosmo_rs_input_file_path = os.path.join(cosmo_dir, cosmo_rs_input_file_name)
+                opt_project_info['conformers'][fingerprint]['file_path']['input']['solv_correction'] = cosmo_rs_input_file_path
 
-            cosmo_rs_input_file_basename = cosmo_rs_input_file_name.split('.')[0]
-            cosmo_rs_input_file = gen_cosmo_rs_input_file(name=cosmo_rs_input_file_basename)
+                cosmo_rs_input_file_basename = cosmo_rs_input_file_name.split('.')[0]
+                cosmo_rs_input_file = gen_cosmo_rs_input_file(name=cosmo_rs_input_file_basename)
 
-            cosmo_rs_output_file_name = str(i) + '_' + str(fingerprint) + '_cosmo.tab'
-            cosmo_rs_output_file_path = os.path.join(cosmo_dir, cosmo_rs_output_file_name)
-            opt_project_info['conformers'][fingerprint]['file_path']['output']['solv_correction'] = cosmo_rs_output_file_path
+                cosmo_rs_output_file_name = str(i) + '_' + str(fingerprint) + '_cosmo.tab'
+                cosmo_rs_output_file_path = os.path.join(cosmo_dir, cosmo_rs_output_file_name)
+                opt_project_info['conformers'][fingerprint]['file_path']['output']['solv_correction'] = cosmo_rs_output_file_path
 
-            with open(cosmo_rs_input_file_path, 'w') as f:
-                f.write(cosmo_rs_input_file)
+                with open(cosmo_rs_input_file_path, 'w') as f:
+                    f.write(cosmo_rs_input_file)
 
-    # 2.c.2.3 Array job submission script
-    # 2.c.2.3.1 for Gaussian cosmo input files
-        last_job_num = len(valid_conformer_hash_ids) - 1
-        sub_script = deepcopy(turbomole_cosmo_slurm_array_script)
-        sub_script = sub_script.format(last_job_num=str(last_job_num))
-        sub_script_file_path = os.path.join(cosmo_dir, 'submit_turbomole_array.sh')
-        with open(sub_script_file_path, 'w') as f:
-            f.write(sub_script)
+        # 2.c.2.3 Array job submission script
+        # 2.c.2.3.1 for Gaussian cosmo input files
+            last_job_num = len(valid_conformer_hash_ids) - 1
+            sub_script = deepcopy(turbomole_cosmo_slurm_array_script)
+            sub_script = sub_script.format(last_job_num=str(last_job_num))
+            sub_script_file_path = os.path.join(cosmo_dir, 'submit_turbomole_array.sh')
+            with open(sub_script_file_path, 'w') as f:
+                f.write(sub_script)
 
-    # 2.c.2.3.2 for cosmo-rs input files
-        cosmo_sub_script = deepcopy(cosmo_slurm_array_script)
-        cosmo_sub_script = cosmo_sub_script.format(last_job_num=str(last_job_num))
-        cosmo_sub_script_file_path = os.path.join(cosmo_dir, 'submit_cosmo_array.sh')
-        with open(cosmo_sub_script_file_path, 'w') as f:
-            f.write(cosmo_sub_script)
+        # 2.c.2.3.2 for cosmo-rs input files
+            cosmo_sub_script = deepcopy(cosmo_slurm_array_script)
+            cosmo_sub_script = cosmo_sub_script.format(last_job_num=str(last_job_num))
+            cosmo_sub_script_file_path = os.path.join(cosmo_dir, 'submit_cosmo_array.sh')
+            with open(cosmo_sub_script_file_path, 'w') as f:
+                f.write(cosmo_sub_script)
 
-    # 2.c.2.4 save cosmo project info
-        cosmo_project_info_path = os.path.join(cosmo_dir, 'cosmo_project_info.yml')
-        write_yaml_file(path=cosmo_project_info_path, content=opt_project_info)
+        # 2.c.2.4 save cosmo project info
+            cosmo_project_info_path = os.path.join(cosmo_dir, 'cosmo_project_info.yml')
+            write_yaml_file(path=cosmo_project_info_path, content=opt_project_info)
 
 
 
