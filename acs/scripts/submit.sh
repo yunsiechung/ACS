@@ -3,7 +3,7 @@
 #SBATCH -o run_ACS.%N.%j.out      	# STDOUT
 #SBATCH -e run_ACS.%N.%j.err      	# STDERR
 #SBATCH -t 1-01:00:00 				# time (DD-HH:MM:SS)
-#SBATCH -n 4          				# number of cores, default is one task per node
+#SBATCH -n 1          				# number of cores, default is one task per node
 #SBATCH -N 1            			# number of nodes
 #SBATCH --mem-per-cpu=4096        	# memory requested per cpu, default 2048 (optional)
 

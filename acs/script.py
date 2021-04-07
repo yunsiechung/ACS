@@ -401,9 +401,9 @@ generic_submit_script = """#!/bin/bash -l
 #SBATCH -o {stdout}.%N.%j.out
 #SBATCH -e {stderr}.%N.%j.err
 #SBATCH -N 1
-#SBATCH -n 4
+#SBATCH -n 1
 #SBATCH --time=00-02:00:00 
-#SBATCH --mem-per-cpu=2000
+#SBATCH --mem-per-cpu=4096
 
 START_TIME=$SECONDS
 
